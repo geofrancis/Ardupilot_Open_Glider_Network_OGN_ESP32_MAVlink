@@ -130,8 +130,7 @@ uint32_t callsignToICAO(String callsign) {
   }
   return hash;
 }
-
-void send_mavlink_adsb(uint32_t icao, float lat, float lon, int32_t alt_ft, String callsignStr) {
+void send_mavlink_adsb(uint32_t icao, float lat, float lon, int32_t alt_ft, String callsignStr, uint8_t emitter_type) {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
 
@@ -145,7 +144,9 @@ void send_mavlink_adsb(uint32_t icao, float lat, float lon, int32_t alt_ft, Stri
   mavlink_msg_adsb_vehicle_pack(
       sys_id, comp_id, &msg, 
       icao, lat_e7, lon_e7, ADSB_ALTITUDE_TYPE_GEOMETRIC, alt_mm, 
-      0, 0, 0, callsign, 0, 1, 0, 0
+      0, 0, 0, callsign, 
+      emitter_type,                  // Dynamically maps aircraft category (e.g., Glider, Rotorcraft)
+      1, 0, 0
   );
   
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
@@ -197,6 +198,12 @@ void loop() {
     
     if (line.indexOf("/A=") != -1 && line.indexOf(">") != -1) {
       String callsign = line.substring(0, line.indexOf(">"));
+      callsign.trim(); 
+
+      // Filter ground stations
+      if (callsign.startsWith("PW")) {
+        return; 
+      }
       
       // Extract Altitude
       int altIndex = line.indexOf("A=");
@@ -208,30 +215,60 @@ void loop() {
       if (hIndex != -1 && line.length() > hIndex + 19) {
         
         // Isolate coordinate substrings
-        String latStr = line.substring(hIndex + 1, hIndex + 9);   // e.g., "5111.32N"
-        String lonStr = line.substring(hIndex + 10, hIndex + 19); // e.g., "00102.04W"
+        String latStr = line.substring(hIndex + 1, hIndex + 9);   
+        String lonStr = line.substring(hIndex + 10, hIndex + 19); 
         
-        // Parse Aircraft Latitude (Degrees + Minutes/60)
+        // Parse Aircraft Latitude
         float target_lat = latStr.substring(0, 2).toFloat();
         target_lat += (latStr.substring(2, 7).toFloat() / 60.0f);
         if (latStr.charAt(7) == 'S') target_lat = -target_lat;
         
-        // Parse Aircraft Longitude (Degrees + Minutes/60)
+        // Parse Aircraft Longitude
         float target_lon = lonStr.substring(0, 3).toFloat();
         target_lon += (lonStr.substring(3, 8).toFloat() / 60.0f);
         if (lonStr.charAt(8) == 'W') target_lon = -target_lon;
 
-        // Print debug information with true positions
-        Serial.print("Mavlink Send -> Aircraft: ");
+        // --- EXTRACT & DECODE AIRCRAFT TYPE ---
+        String acType = "Unknown";
+        uint8_t emitterType = 0; // Default: MAVLink Unknown Type Code
+        
+        int idIndex = line.indexOf("id");
+        if (idIndex != -1 && line.length() > idIndex + 4) {
+          String xxStr = line.substring(idIndex + 2, idIndex + 4);
+          uint8_t xx = (uint8_t)strtoul(xxStr.c_str(), NULL, 16);
+          uint8_t typeNum = (xx >> 2) & 0x0F; // Extract bits 2,3,4,5
+          
+          switch(typeNum) {
+            case 1:  acType = "Glider";          emitterType = 9;  break; // ADSB_EMITTER_TYPE_GLIDER
+            case 2:  acType = "Tow Plane";       emitterType = 1;  break; // ADSB_EMITTER_TYPE_LIGHT
+            case 3:  acType = "Helicopter";      emitterType = 7;  break; // ADSB_EMITTER_TYPE_ROTORCRAFT
+            case 4:  acType = "Parachutist";     emitterType = 11; break; // ADSB_EMITTER_TYPE_PARACHUTIST
+            case 5:  acType = "Drop Plane";      emitterType = 1;  break; 
+            case 6:  acType = "Hang Glider";     emitterType = 12; break; // ADSB_EMITTER_TYPE_ULTRA_LIGHT
+            case 7:  acType = "Paraglider";      emitterType = 12; break; 
+            case 8:  acType = "Powered GA";      emitterType = 1;  break; 
+            case 9:  acType = "Jet/Turboprop";   emitterType = 6;  break; // ADSB_EMITTER_TYPE_HIGH_PERFORMANCE
+            case 11: acType = "Balloon";         emitterType = 10; break; // ADSB_EMITTER_TYPE_LIGHTER_THAN_AIR
+            case 12: acType = "Airship";         emitterType = 10; break; 
+            case 13: acType = "UAV/Drone";       emitterType = 14; break; // ADSB_EMITTER_TYPE_UAV
+            case 15: acType = "Obstacle";        emitterType = 0;  break;
+            default: acType = "Unknown";         emitterType = 0;  break;
+          }
+        }
+
+        // Output matching metadata seamlessly to the terminal
+        Serial.print("Mavlink Send -> Type: [");
+        Serial.print(acType);
+        Serial.print("] Callsign: ");
         Serial.print(callsign);
         Serial.print(" | Pos: "); Serial.print(target_lat, 5);
         Serial.print(", "); Serial.print(target_lon, 5);
         Serial.print(" | Alt: "); Serial.print(alt_ft);
         Serial.println(" ft");
 
-        // Generate dynamic ID and stream raw traffic directly to ArduPilot
+        // Stream parsed attributes to the flight controller
         uint32_t numeric_icao = callsignToICAO(callsign);
-        send_mavlink_adsb(numeric_icao, target_lat, target_lon, alt_ft, callsign);
+        send_mavlink_adsb(numeric_icao, target_lat, target_lon, alt_ft, callsign, emitterType);
       }
     }
   }
